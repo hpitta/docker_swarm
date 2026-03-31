@@ -1,325 +1,273 @@
-**Playbook de Implantação – Docker Swarm (3 nós) + Traefik + OCI Load Balancer + BookStack**
+# 🐳 Infraestrutura Docker Swarm na Oracle Cloud (OCI)
 
-_Ambiente corporativo – passo a passo e automação (scripts)_
 
-Data: 13/01/2026
 
-Autor: Hercules
+Este repositório contém o código Terraform e scripts de automação para provisionar um cluster **Docker Swarm** de Alta Disponibilidade na Oracle Cloud Infrastructure (OCI).
 
-# 1\. Objetivo
 
-Este documento descreve, do zero, como preparar 3 máquinas Linux na Oracle OCI, criar um cluster Docker Swarm com alta disponibilidade, publicar um Traefik como Ingress/Reverse Proxy e disponibilizar aplicações (ex.: BookStack) atrás de um Load Balancer público da OCI. Ao final, você terá um conjunto de scripts para repetir o deploy sem refazer tudo manualmente.
 
-# 2\. Visão geral da arquitetura
+## 🏗 Arquitetura
 
-- DNS público: culturainglesa.com.br (ex.: bookstack.culturainglesa.com.br).
-- OCI Load Balancer (público): termina TLS com certificado wildcard (\*.culturainglesa.com.br).
-- Backend do LB: nós do Swarm (ports 80/443 publicados em modo host pelo Traefik).
-- Traefik (no Swarm): roteia por Host/Path para as stacks (BookStack, etc.).
-- Rede overlay 'traefik_proxy' para as aplicações publicarem seus routers/services via labels.
 
-Observação sobre TLS: como o certificado wildcard ficará no Load Balancer, o caminho mais simples e comum é terminar TLS no LB e encaminhar HTTP para o Traefik (porta 80). Se você quiser criptografia ponta-a-ponta, é possível recriptografar até o Traefik (TLS no Traefik também), mas isso adiciona complexidade e, na prática, o link LB->backend costuma estar em rede controlada (VCN).
 
-# 3\. Pré-requisitos
+O projeto provisiona 3 máquinas virtuais (Compute Instances) com **IPs fixos** na rede privada, garantindo previsibilidade para o cluster.
 
-## 3.1 Infraestrutura (OCI)
 
-- 3 VMs Linux (ex.: Oracle Linux / Rocky / Ubuntu) na mesma VCN/subnet privada.
-- IP público apenas via Load Balancer (recomendado).
-- Security Lists/NSG liberando do Load Balancer para os nós: TCP 80 e TCP 443 (backend).
-- Acesso administrativo (SSH) aos nós.
-- File Storage (FSS) opcional para persistir configs (traefik dynamic/, acme/, stacks/).
 
-## 3.2 Sistema operacional
+| Hostname | IP Privado | Função Sugerida | Shape | SO |
 
-- Hostname e resolução DNS interna ajustados (ou /etc/hosts) entre os nós.
-- Sincronismo de horário (chrony/ntpd).
-- Usuário com sudo (ou root) para instalação/configuração.
-- Portas locais: 2377/tcp (Swarm management), 7946/tcp+udp (gossip), 4789/udp (VXLAN).
+| :--- | :--- | :--- | :--- | :--- |
 
-## 3.3 Convenções usadas neste playbook
+| **cidk01** | `172.16.13.213` | Manager / Leader | VM.Standard.E5.Flex (1 OCPU, 4GB RAM) | Oracle Linux 9 |
 
-Exemplo de nós (ajuste conforme seu ambiente):
+| **cidk02** | `172.16.13.214` | Manager | VM.Standard.E5.Flex (1 OCPU, 4GB RAM) | Oracle Linux 9 |
 
-- cidk01 – manager (leader)
-- cidk02 – worker
-- cidk03 – worker
+| **cidk03** | `172.16.13.215` | Manager | VM.Standard.E5.Flex (1 OCPU, 4GB RAM) | Oracle Linux 9 |
 
-Caminho de stacks em FSS (ajuste se necessário): /mnt/fss/stacks/
 
-# 4\. Preparação dos nós (do zero)
 
-## 4.1 Atualização e pacotes básicos
+> **Nota:** Todos os nós são configurados como **Managers** para garantir tolerância a falhas (HA).
 
-Execute em TODOS os nós:
 
-sudo dnf -y update || sudo apt-get update && sudo apt-get -y upgrade  
-sudo dnf -y install curl wget jq vim tar unzip git rsync || true  
 
-## 4.2 Ajuste de hostname e hosts
+---
 
-Em cada nó, defina hostname (exemplo):
 
-sudo hostnamectl set-hostname cidk01  
 
-Garanta que os nós se resolvam (exemplo em /etc/hosts):
+## ⚙️ Pré-requisitos
 
-172.16.13.213 cidk01  
-172.16.13.214 cidk02  
-172.16.13.215 cidk03  
 
-## 4.3 Instalação do Docker Engine
 
-A forma exata depende da distro. Exemplo para Oracle Linux/RHEL-like (ajuste conforme seu repositório):
+Antes de executar o pipeline, certifique-se de que os seguintes recursos existem no Console da Oracle:
 
-sudo dnf -y install dnf-utils  
-sudo dnf config-manager --add-repo https://download.docker.com/linux/centos/docker-ce.repo  
-sudo dnf -y install docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin  
-sudo systemctl enable --now docker  
-sudo docker version  
 
-Valide que o Docker iniciou sem erros:
 
-sudo systemctl status docker --no-pager  
+1.  **Compartment:** O ID (OCID) do compartimento onde as máquinas ficarão.
 
-## 4.4 Firewall/Security (Swarm)
+2.  **VCN e Subnet:** A rede virtual e a sub-rede privada configurada.
 
-Se houver firewall local (firewalld/ufw), libere as portas do Swarm. Exemplo firewalld:
+3.  **Tag Namespace:**
 
-sudo firewall-cmd --permanent --add-port=2377/tcp  
-sudo firewall-cmd --permanent --add-port=7946/tcp  
-sudo firewall-cmd --permanent --add-port=7946/udp  
-sudo firewall-cmd --permanent --add-port=4789/udp  
-sudo firewall-cmd --permanent --add-port=80/tcp  
-sudo firewall-cmd --permanent --add-port=443/tcp  
-sudo firewall-cmd --reload  
+    * Namespace: `Ambiente_Datacenter`
 
-## 4.5 (Opcional) Montar OCI File Storage (FSS) em /mnt/fss
+    * Chave (Key): `AMBIENTE`
 
-Se você usa FSS, monte-o em TODOS os nós, no mesmo caminho. Exemplo NFS:
+    * *Sem isso, o Terraform falhará ao tentar aplicar as tags.*
 
-sudo mkdir -p /mnt/fss  
-\# Exemplo genérico (ajuste servidor/export):  
-\# sudo mount -t nfs -o vers=3,hard,timeo=600,retrans=2 &lt;FSS_IP&gt;:/&lt;export&gt; /mnt/fss  
-\# Persistir no /etc/fstab após validar a montagem.  
 
-Crie a estrutura base:
 
-sudo mkdir -p /mnt/fss/stacks/traefik/{dynamic,acme}  
-sudo mkdir -p /mnt/fss/stacks/apps  
-sudo chmod -R 755 /mnt/fss/stacks  
+---
 
-# 5\. Criação do Swarm
 
-## 5.1 Inicializar Swarm no manager (cidk01)
 
-No cidk01:
+## 🔐 Configuração do Bitbucket (Variáveis)
 
-sudo docker swarm init --advertise-addr 172.16.13.213  
-sudo docker node ls  
 
-Capture o token de join:
 
-sudo docker swarm join-token worker  
+As seguintes variáveis devem ser cadastradas em **Repository settings > Repository variables**:
 
-## 5.2 Entrar com os workers (cidk02/cidk03)
 
-Nos workers, execute o comando retornado pelo join-token. Exemplo:
 
-sudo docker swarm join --token &lt;TOKEN_WORKER&gt; 172.16.13.213:2377  
+| Variável | Descrição | Exemplo / Formato |
 
-## 5.3 Validar cluster
+| :--- | :--- | :--- |
 
-sudo docker node ls  
-sudo docker info | egrep -i 'Swarm|NodeID|Is Manager'  
+| `TF_VAR_tenancy_ocid` | OCID da sua Tenancy | `ocid1.tenancy.oc1...` |
 
-# 6\. Rede overlay para o Traefik e apps
+| `TF_VAR_user_ocid` | OCID do usuário Terraform | `ocid1.user.oc1...` |
 
-Crie uma rede overlay externa (uma vez, no manager):
+| `TF_VAR_fingerprint` | Fingerprint da API Key | `xx:xx:xx...` |
 
-sudo docker network create --driver=overlay --attachable traefik_proxy  
-sudo docker network ls | grep traefik_proxy  
+| `TF_VAR_region` | Região da OCI | `sa-saopaulo-1` |
 
-# 7\. Traefik (Ingress) no Swarm
+| `TF_VAR_compartment_ocid` | OCID do Compartimento | `ocid1.compartment...` |
 
-## 7.1 Arquivos de configuração (dynamic)
+| `TF_VAR_subnet_ocid` | OCID da Subnet Privada | `ocid1.subnet...` |
 
-Os arquivos abaixo ficam em /mnt/fss/stacks/traefik/dynamic/ e são montados no container em /etc/traefik/dynamic.
+| `TF_VAR_image_ocid` | ID da Imagem Oracle Linux 9 | `ocid1.image...` |
 
-1) auth.yml (BasicAuth do dashboard) – gere o hash com htpasswd (bcrypt):
+| `TF_VAR_private_key` | Chave Privada API (Base64) | Conteúdo do `.pem` convertido com `base64 -w 0` |
 
-docker run --rm httpd:2-alpine htpasswd -nbB admin '$Info1000$'  
-\# Saída exemplo:  
-\# admin:$2y$05$YHthyVrWIBLOyAAfKea7JOXxjzWE3vafZnCD8i6o6eZxRBPFqJs8K  
+| `TF_VAR_ssh_public_key` | Chaves Públicas SSH | Conteúdo do `.pub`. Recomenda-se colocar a chave do Bastion (linha 1) e a dos Admins (linha 2). |
 
-Crie/edite /mnt/fss/stacks/traefik/dynamic/auth.yml:
 
-http:  
-middlewares:  
-dashboard-auth:  
-basicAuth:  
-users:  
-\- " admin:$2y$05$YHthyVrWIBLOyAAfKea7JOXxjzWE3vafZnCD8i6o6eZxRBPFqJs8K"  
 
-2) dashboard.yml – redirect HTTP->HTTPS e expõe dashboard/api somente em HTTPS com auth:
+---
 
-## http: middlewares: redirect-to-https: redirectScheme: scheme: https permanent: true routers: redirect-web-to-websecure: entryPoints: - web rule: "HostRegexp(\`{host:.+}\`)" middlewares: - redirect-to-https service: noop@internal traefik-dashboard: entryPoints: - websecure rule: "Host(\`traefik.local\`) && (PathPrefix(\`/api\`) || PathPrefix(\`/dashboard\`))" middlewares: - dashboard-auth service: api@internal tls: {} 7.2 stack.yml do Traefik (completo)
 
-Salve como: /mnt/fss/stacks/traefik/stack.yml
 
-version: "3.9"
+## 🚀 O Script de Automação (`user_data`)
 
-networks:
 
-proxy:
 
-external: true
+As máquinas utilizam o script `scripts/docker_install.sh` via *Cloud-init* no primeiro boot.
 
-name: traefik_proxy
 
-services:
 
-traefik:
+**Principais funcionalidades do script:**
 
-image: traefik:latest
+1.  **Instalação Blindada (Anti-Lock):** Utiliza uma função de *Retry* inteligente. Se o processo de atualização automática do Oracle Linux bloquear o `dnf`, o script aguarda e tenta novamente (até 10x), evitando falhas de provisionamento.
 
-networks:
+2.  **Limpeza:** Remove pacotes conflitantes nativos do Oracle Linux 9 (`podman`, `buildah`, `runc`).
 
-\- proxy
+3.  **Firewall:** Abre automaticamente as portas necessárias para o Swarm:
 
-ports:
+    * `2377/tcp`: Gerenciamento do Cluster.
 
-\# Publicação em modo host para o OCI LB apontar diretamente para os nós
+    * `7946/tcp` e `udp`: Comunicação entre nós.
 
-\- target: 80
+    * `4789/udp`: Rede Overlay (tráfego dos containers).
 
-published: 80
+4.  **Permissões:** Adiciona o usuário `opc` ao grupo `docker`.
 
-protocol: tcp
 
-mode: host
 
-\- target: 443
+**Logs de Execução:**
 
-published: 443
+Para debugar a instalação, acesse a máquina e verifique o log:
 
-protocol: tcp
+```bash
 
-mode: host
+tail -f /var/log/user_data.log
 
-volumes:
+```
 
-\- /var/run/docker.sock:/var/run/docker.sock:ro
 
-\- /mnt/fss/stacks/traefik/dynamic:/etc/traefik/dynamic:ro
 
-\- /mnt/fss/stacks/traefik/acme:/acme
+---
 
-command:
 
-\# Providers
 
-\- --providers.swarm=true
+## 🛠 Pós-Provisionamento (Configuração do Cluster)
 
-\- --providers.swarm.exposedbydefault=false
 
-\- --providers.swarm.endpoint=unix:///var/run/docker.sock
 
-\- --providers.file.directory=/etc/traefik/dynamic
+Após o Terraform concluir a criação ("Apply"), o Cluster Swarm deve ser iniciado manualmente. Siga os passos:
 
-\- --providers.file.watch=true
 
-\# EntryPoints
 
-\- --entrypoints.web.address=:80
+### 1. Iniciar o Cluster (No Líder)
 
-\- --entrypoints.websecure.address=:443
+Acesse via SSH o nó **cidk01** (`172.16.13.213`) e execute:
 
-\- --entrypoints.websecure.http.tls=true
+```bash
 
-\# API/Dashboard (exposto via file provider)
+docker swarm init --advertise-addr 172.16.13.213
 
-\- --api.dashboard=true
+```
 
-\- --api.insecure=false
+*Copie o comando `docker swarm join --token ...` que será exibido.*
 
-\# Logs
 
-\- --log.level=INFO
 
-\- --accesslog=true
+### 2. Adicionar os Nós (Nos Workers)
 
-\# (Opcional) Ping/Healthcheck interno
+Acesse **cidk02** e **cidk03** e cole o comando copiado:
 
-\- --ping=true
+```bash
 
-\- --entrypoints.traefik.address=:8080
+docker swarm join --token SWMTKN-1-xxxxx 172.16.13.213:2377
 
-deploy:
+```
 
-mode: global
 
-placement:
 
-constraints:
+### 3. Promover a Managers (Alta Disponibilidade)
 
-\- node.platform.os == linux
+Para garantir HA, volte ao **cidk01** e promova os outros nós a gerentes:
 
-restart_policy:
+```bash
 
-condition: on-failure
+docker node promote cidk02 cidk03
 
-update_config:
+```
 
-parallelism: 1
 
-order: stop-first
 
-labels:
+### 4. Verificação Final
 
-\- traefik.enable=false  
-<br/>
+Ainda no **cidk01**, verifique se todos estão como `Reachable` ou `Leader`:
 
-## 7.3 Deploy do Traefik
+```bash
 
-No manager (cidk01):
+docker node ls
 
-sudo docker stack deploy -c /mnt/fss/stacks/traefik/stack.yml traefik  
-sudo docker stack ps traefik --no-trunc  
-sudo docker service logs --tail 100 traefik_traefik  
+```
 
-Testes locais (exemplo):
 
-\# HTTP deve redirecionar para HTTPS (308)  
-curl -sI -H 'Host: traefik.local' http://127.0.0.1/dashboard/ | egrep -i 'HTTP/|location:'  
-<br/>\# Acesso HTTPS com basic auth (exemplo)  
-curl -sk -u 'admin:$Info1000$' -H 'Host: traefik.local' https://127.0.0.1/api/rawdata | head  
 
-# 8\. Publicando aplicações no Swarm
+---
 
-## 9.1 Exemplo whoami (teste)
 
-Arquivo whoami.yml (exemplo) – observe que você pode escolher expor via web (80) ou websecure (443).
 
-version: "3.9"  
-<br/>networks:  
-proxy:  
-external: true  
-name: traefik_proxy  
-<br/>services:  
-whoami:  
-image: traefik/whoami  
-networks:  
-\- proxy  
-deploy:  
-labels:  
-\- traefik.enable=true  
-\- traefik.http.routers.whoami.rule=Host(\`whoami.local\`)  
-\- traefik.http.routers.whoami.entrypoints=websecure  
-\- traefik.http.routers.whoami.tls=true  
-\- traefik.http.services.whoami.loadbalancer.server.port=80  
+## 🚨 Troubleshooting & Dicas
 
-Deploy:
 
-sudo docker stack deploy -c /mnt/fss/stacks/traefik/whoami.yml apps  
-curl -s -H 'Host: whoami.local' http://127.0.0.1/
+
+### Erro: "Permission denied (publickey)" no primeiro acesso
+
+Se você recriou as máquinas, a "impressão digital" mudou. Limpe o histórico no Bastion:
+
+```bash
+
+ssh-keygen -R 172.16.13.213
+
+ssh-keygen -R 172.16.13.214
+
+ssh-keygen -R 172.16.13.215
+
+```
+
+
+
+### Erro de Chave SSH Antiga (RSA/SHA1)
+
+O Oracle Linux 9 tem políticas de segurança rígidas. Se sua chave SSH for antiga e for rejeitada pelo servidor, acesse com uma chave válida (ex: Bastion) e execute na máquina alvo:
+
+```bash
+
+sudo update-crypto-policies --set DEFAULT:SHA1
+
+sudo reboot
+
+```
+
+
+
+### Governança e Tags
+
+As instâncias são criadas automaticamente com a seguinte Tag Definida para controle de custos e ambiente:
+
+* **Namespace:** `Ambiente_Datacenter`
+
+* **Chave:** `AMBIENTE`
+
+* **Valor:** `PRODUCAO`
+
+
+
+---
+
+
+
+### 📝 Comandos Úteis
+
+
+
+**Ver logs do Docker:**
+
+```bash
+
+sudo journalctl -u docker -f
+
+```
+
+
+
+**Listar serviços rodando no Swarm:**
+
+```bash
+
+docker service ls
+
+```
