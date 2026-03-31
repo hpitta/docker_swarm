@@ -1,0 +1,14 @@
+image: hashicorp/terraform:light
+
+pipelines:
+  branches:
+    main:
+      - step:
+          name: 'Planejar e Aplicar Infraestrutura'
+          script:
+            # Aqui está o segredo: passamos a URL do Backend dinamicamente
+            - terraform init -backend-config="address=${TF_STATE_URL}" -backend-config="update_method=PUT"
+            
+            - terraform validate
+            - terraform plan -out=tfplan
+            - terraform apply -auto-approve tfplan
